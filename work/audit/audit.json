@@ -1,0 +1,20 @@
+{
+  "name": "clip5.mp4",
+  "n_frames_checked": 120,
+  "shape": [
+    2160,
+    3840
+  ],
+  "ir_night_mode": false,
+  "duplicate_fraction": 0.0,
+  "separability": {
+    "blue": 17.181060791015625,
+    "green": 8.831379890441895,
+    "red": 3.644266128540039,
+    "gray": 8.782410621643066,
+    "minrgb": 17.12549591064453,
+    "blue-0.15red": 19.015037536621094
+  },
+  "best_channel": "blue-0.15red",
+  "warnings": []
+}
