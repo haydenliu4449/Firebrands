@@ -72,7 +72,8 @@ def masks_from_detections(dets, shape, width=3):
 
 
 def build_tiles(source, masks_by_frame, dcfg: DetectConfig, tcfg: TrainConfig,
-                roi_mask=None, keep_empty_frac=0.15, rng=None, max_tiles=None):
+                roi_mask=None, keep_empty_frac=0.15, rng=None, max_tiles=None,
+                max_per_frame=48):
     """Residual stacks + masks -> training tiles.
 
     `keep_empty_frac` controls how many all-negative tiles survive. Keeping
@@ -88,12 +89,22 @@ def build_tiles(source, masks_by_frame, dcfg: DetectConfig, tcfg: TrainConfig,
         m = masks_by_frame.get(i)
         if m is None:
             continue
-        for (y, x) in tile_positions(stack.shape[1:], tcfg.tile, tcfg.stride):
+        # A 4K frame has 220 tile positions against 60 at 1080p, and the extra
+        # ones are overwhelmingly empty background. Shuffling and capping keeps
+        # the set from being dominated by one resolution's geometry.
+        pos = tile_positions(stack.shape[1:], tcfg.tile, tcfg.stride)
+        if max_per_frame and len(pos) > max_per_frame:
+            rng.shuffle(pos)
+        kept_here = 0
+        for (y, x) in pos:
+            if max_per_frame and kept_here >= max_per_frame:
+                break
             mt = m[y:y + tcfg.tile, x:x + tcfg.tile]
             if mt.max() < 0.2 and rng.random() > keep_empty_frac:
                 continue
             X.append(stack[:, y:y + tcfg.tile, x:x + tcfg.tile])
             Y.append(mt)
+            kept_here += 1
             if max_tiles and len(X) >= max_tiles:
                 return np.array(X, np.uint8), np.array(Y, np.float32)
     if not X:
@@ -103,25 +114,77 @@ def build_tiles(source, masks_by_frame, dcfg: DetectConfig, tcfg: TrainConfig,
 
 
 def build_from_synthetic(background, n_frames, cfg, seed=0, max_tiles=None,
-                         roi_mask=None):
-    """The main training-set generator: render a synthetic clip on a real
-    background and tile it. Ground truth is exact by construction.
+                         roi_mask=None, chunk=40, progress=True):
+    """Render synthetic clips and tile them, in bounded memory.
 
-    Returns (X, Y) plus the clip so you can spot-check what the model is being
-    shown -- always look at a few samples before a long training run.
+    GENERATED IN CHUNKS ON PURPOSE. The obvious implementation renders all
+    n_frames, then re-encodes them, then tiles them -- and at 3840x2160 one
+    frame is 25 MB, so 200 frames is 5 GB live, and the re-encode briefly holds
+    both copies at 10 GB. That does not fit in a 16 GB VM alongside everything
+    else, and the swapping turns eleven minutes of real work into over an hour.
+    Chunking caps the frame buffer at `chunk` frames (40 x 25 MB = 1 GB) and
+    keeps only the tiles, which are small.
+
+    Each chunk is an independent short clip, so particles do not continue
+    across a chunk boundary. That costs nothing here: tiles are per-frame, and
+    the 3-frame residual stack never spans a boundary.
+
+    Returns (X, Y, sample_frames, sample_gt) -- the samples are from the FIRST
+    chunk only, for eyeballing; the full clip is never held in memory.
     """
-    frames, gt = S.make_clip(background, n_frames, cfg.synth, seed=seed,
-                             roi_mask=roi_mask)
-    if cfg.synth.reencode_h264:
-        frames = S.reencode(frames, fps=int(cfg.track.fps))
-    shape = frames[0].shape
-    masks = {i: S.gt_masks(g, shape) for i, g in enumerate(gt)}
-
     from .frames import ArraySource
-    X, Y = build_tiles(ArraySource(frames), masks, cfg.detect, cfg.train,
-                       roi_mask=roi_mask, rng=np.random.default_rng(seed),
-                       max_tiles=max_tiles)
-    return X, Y, frames, gt
+
+    rng_seed = seed
+    Xs, Ys = [], []
+    sample_frames, sample_gt = None, None
+    n_done = 0
+    total_tiles = 0
+
+    # residual_stacks needs median_window frames of context before it yields
+    # anything, so a chunk smaller than that produces nothing at all.
+    min_chunk = cfg.detect.median_window + cfg.train.n_frames_stack + 2
+    chunk = max(int(chunk), min_chunk)
+
+    while n_done < n_frames:
+        n = min(chunk, n_frames - n_done)
+        if n < min_chunk and n_done > 0:
+            break                                  # trailing stub yields nothing
+        frames, gt = S.make_clip(background, n, cfg.synth, seed=rng_seed,
+                                 roi_mask=roi_mask)
+        if cfg.synth.reencode_h264:
+            frames = S.reencode(frames, fps=int(cfg.track.fps))
+
+        shape = frames[0].shape
+        masks = {i: S.gt_masks(g, shape) for i, g in enumerate(gt)}
+        x, y = build_tiles(ArraySource(frames), masks, cfg.detect, cfg.train,
+                           roi_mask=roi_mask,
+                           rng=np.random.default_rng(rng_seed),
+                           max_tiles=None if max_tiles is None
+                           else max(max_tiles - total_tiles, 0))
+        if len(x):
+            Xs.append(x); Ys.append(y)
+            total_tiles += len(x)
+
+        if sample_frames is None:
+            sample_frames, sample_gt = frames[:6], gt[:6]
+
+        n_done += n
+        rng_seed += 1
+        if progress:
+            print(f"    synth {n_done}/{n_frames} frames, {total_tiles} tiles",
+                  flush=True)
+        del frames, masks                          # let the chunk go before the next
+        if max_tiles and total_tiles >= max_tiles:
+            break
+
+    if not Xs:
+        empty_x = np.zeros((0, cfg.train.n_frames_stack, cfg.train.tile,
+                            cfg.train.tile), np.uint8)
+        return empty_x, np.zeros((0, cfg.train.tile, cfg.train.tile), np.float32), \
+            sample_frames or [], sample_gt or []
+
+    return (np.concatenate(Xs), np.concatenate(Ys),
+            sample_frames, sample_gt)
 
 
 def save_tiles(path, X, Y):

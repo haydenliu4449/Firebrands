@@ -1,0 +1,10 @@
+clips/
+*.mp4
+*.mov
+*.avi
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.firebrand_cache/
+*.json
+!mask_specs/*.json

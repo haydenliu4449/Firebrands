@@ -179,6 +179,7 @@ pip install torch                    # only needed for the learned model
 
 ---
 
+<<<<<<< HEAD
 ## Scripts, not notebooks, for anything slow
 
 A Jupyter kernel holds everything in memory. When it reconnects — and on a long
@@ -215,6 +216,8 @@ without holding an hour of compute in a kernel that might drop.
 
 ---
 
+=======
+>>>>>>> 16450dac8a61d048778a54c2fbed4f06e1af56df
 ## Stage 0 — check the install, before touching your data
 
 ```bash

@@ -218,7 +218,7 @@ def is_ir(frame, tol=2.0) -> bool:
     return float(np.mean(np.abs(b - r)) + np.mean(np.abs(b - g))) < tol
 
 
-def duplicate_frame_fraction(source, max_frames=300, tol=0.05) -> float:
+def duplicate_frame_fraction(source, max_frames=120, tol=0.05) -> float:
     """Fraction of consecutive frame pairs that are (near-)identical.
 
     Many DVRs advertise 30 fps but repeat frames from a 15 fps sensor. If this
@@ -230,6 +230,9 @@ def duplicate_frame_fraction(source, max_frames=300, tol=0.05) -> float:
         if i >= max_frames:
             break
         g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+        if g.shape[1] > 960:          # a duplicate is a duplicate at any scale
+            g = cv2.resize(g, (960, int(960 * g.shape[0] / g.shape[1])),
+                           interpolation=cv2.INTER_AREA)
         if prev is not None:
             total += 1
             if float(np.mean(np.abs(g.astype(np.int16) - prev.astype(np.int16)))) < tol:
@@ -262,12 +265,22 @@ def channel_separability(frame, top_pct=0.05) -> dict:
     return out
 
 
-def audit(source, name="clip") -> dict:
+def audit(source, name="clip", max_frames=None) -> dict:
     """Run every pre-flight check and return a report. Read it before trusting
-    anything the pipeline produces."""
+    anything the pipeline produces.
+
+    The frame budget scales with resolution. This used to keep 300 frames
+    unconditionally, which is 7.5 GB at 3840x2160 -- on top of whatever the
+    caller was already holding. Every check here (IR mode, duplicate rate,
+    channel separability) is answered just as well by a few dozen frames.
+    """
     frames = []
+    cap = max_frames
     for i, f in enumerate(source):
-        if i >= 300:
+        if cap is None:
+            px = f.shape[0] * f.shape[1]
+            cap = 300 if px <= 1_000_000 else (120 if px <= 2_500_000 else 48)
+        if i >= cap:
             break
         frames.append(f)
     if not frames:

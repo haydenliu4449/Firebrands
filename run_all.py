@@ -62,6 +62,21 @@ from firebrand import synth as S, dataset as DS, evaluate as E, gcsio
 VIDEO_EXTS = {".mp4", ".avi", ".mov", ".mkv", ".m4v"}
 
 
+class _Gen:
+    """Re-iterable frame source over a generator factory.
+
+    The pipeline's consumers each want to walk the clip from the start, and a
+    plain generator is exhausted after one pass. This re-opens the stream per
+    iteration so nothing has to hold the frames.
+    """
+
+    def __init__(self, factory):
+        self.factory = factory
+
+    def __iter__(self):
+        return iter(self.factory())
+
+
 # ---------------------------------------------------------------------------
 # logging: timestamped and flushed, so `tail -f` is actually live
 # ---------------------------------------------------------------------------
@@ -134,18 +149,26 @@ def stage_detect(args, cfg):
             continue
 
         out.mkdir(parents=True, exist_ok=True)
-        with Timer(f"  {name}: decoding"):
-            src = F.VideoSource(clip)
-            fr = []
+
+        # STREAMED, never materialised. At 3840x2160 a frame is 25 MB, so a
+        # 300-frame list is 7.5 GB -- and the audit used to keep a second copy.
+        # Detection only ever needs an 11-frame rolling window (275 MB), and
+        # every other consumer here can take a second pass over the file.
+        src = F.VideoSource(clip)
+
+        def stream(limit=args.max_frames):
             for i, f in enumerate(src):
-                if args.max_frames and i >= args.max_frames:
-                    break
-                fr.append(f)
-        if not fr:
+                if limit and i >= limit:
+                    return
+                yield f
+
+        first = next(iter(stream(1)), None)
+        if first is None:
             log(f"  {name}: no frames decoded, skipping")
             continue
+        H, W = first.shape[:2]
+        n_frames = min(len(src) or 10 ** 9, args.max_frames or 10 ** 9)
 
-        H, W = fr[0].shape[:2]
         c = Config()
         c.detect.__dict__.update(cfg.detect.__dict__)
         c.track.__dict__.update(cfg.track.__dict__)
@@ -154,9 +177,10 @@ def stage_detect(args, cfg):
         if W * H > 2_500_000 and c.detect.bg_refresh == 1:
             c.detect.bg_refresh = 4
 
-        audit = F.audit(F.ArraySource(fr), name)
+        with Timer(f"  {name}: auditing"):
+            audit = F.audit(_Gen(stream), name)
         json.dump(audit, open(out / "audit.json", "w"), indent=2, default=str)
-        log(f"  {name}: {len(fr)} frames {W}x{H} @ {c.track.fps:.1f}fps, "
+        log(f"  {name}: {n_frames} frames {W}x{H} @ {c.track.fps:.1f}fps, "
             f"blue sep {audit['separability'].get('blue', 0):.1f}σ, "
             f"dup {audit['duplicate_fraction']:.0%}")
         for w in audit["warnings"]:
@@ -170,11 +194,11 @@ def stage_detect(args, cfg):
         elif not args.no_mask:
             roi = F.make_roi_mask((H, W), **F.LEFT_FRONT_OVERLAYS)
         if roi is not None:
-            cv2.imwrite(str(out / "roi_mask.png"), F.overlay_mask(fr[0], roi))
+            cv2.imwrite(str(out / "roi_mask.png"), F.overlay_mask(first, roi))
 
         with Timer(f"  {name}: detecting"):
-            dets = D.detect_source(F.ArraySource(fr), c.detect, roi,
-                                   progress=progress_printer(len(fr)))
+            dets = D.detect_source(_Gen(stream), c.detect, roi,
+                                   progress=progress_printer(n_frames))
 
         ratio, diag = T.estimate_step_ratio(dets, c.track, return_diagnostics=True)
         c.track.step_ratio = ratio
@@ -191,35 +215,39 @@ def stage_detect(args, cfg):
         if rej:
             pd.DataFrame(T.summarize(rej, c.track)).to_csv(out / "negatives.csv",
                                                            index=False)
-        # Pickle the track objects so `tiles` does not have to re-detect.
         with open(out / "tracks.pkl", "wb") as fh:
             pickle.dump({"accepted": acc, "rejected": rej}, fh)
 
-        R.make_contact_sheets(acc, fr, out / "review")
-        cv2.imwrite(str(out / "fp_heatmap.png"),
-                    R.fp_heatmap(rej, acc, fr[len(fr) // 2]))
-        if args.overlay:
-            by = {}
-            for t in acc:
-                for d in t.dets:
-                    by.setdefault(d.frame, []).append(d)
-            vw = cv2.VideoWriter(str(out / "overlay.mp4"),
-                                 cv2.VideoWriter_fourcc(*"mp4v"), c.track.fps, (W, H))
-            for i, f in enumerate(fr):
-                vw.write(D.draw(f, by.get(i, [])))
-            vw.release()
+        # Second pass: contact-sheet crops, the heatmap frame, background
+        # frames and the overlay video, all from one stream.
+        with Timer(f"  {name}: review artefacts"):
+            R.make_contact_sheets_streaming(acc, _Gen(stream), out / "review")
 
-        # A few real background frames for the synthetic generator later.
-        # PNG, not .npy: 12 raw 4K frames is ~300 MB per clip, and at that size
-        # the disk fills long before the frames are useful. Lossless PNG is
-        # ~5 MB each, and lossless matters -- JPEG ringing around a streak is
-        # exactly the artifact the model must not learn.
-        bgdir = out / "bg"
-        bgdir.mkdir(exist_ok=True)
-        for k, f in enumerate(fr[:12]):
-            cv2.imwrite(str(bgdir / f"{k:03d}.png"), f)
+            bgdir = out / "bg"
+            bgdir.mkdir(exist_ok=True)
+            by = {}
+            for tr in acc:
+                for d in tr.dets:
+                    by.setdefault(d.frame, []).append(d)
+            vw = None
+            if args.overlay:
+                vw = cv2.VideoWriter(str(out / "overlay.mp4"),
+                                     cv2.VideoWriter_fourcc(*"mp4v"),
+                                     c.track.fps, (W, H))
+            mid = n_frames // 2
+            for i, f in enumerate(stream()):
+                if i < 12:
+                    cv2.imwrite(str(bgdir / f"{i:03d}.png"), f)
+                if i == mid:
+                    cv2.imwrite(str(out / "fp_heatmap.png"),
+                                R.fp_heatmap(rej, acc, f))
+                if vw is not None:
+                    vw.write(D.draw(f, by.get(i, [])))
+            if vw is not None:
+                vw.release()
+
         c.save(out / "config.json")
-        json.dump({"clip": clip, "n_frames": len(fr), "shape": [H, W],
+        json.dump({"clip": clip, "n_frames": n_frames, "shape": [H, W],
                    "fps": c.track.fps, "n_accepted": len(acc),
                    "n_rejected": len(rej), "step_ratio": ratio},
                   open(flag, "w"), indent=2)

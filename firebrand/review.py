@@ -51,6 +51,89 @@ def track_strip(track, frames, crop=36, max_cells=10, scale=2):
     return np.hstack(cells)
 
 
+def collect_crops(source, tracks, crop=36, max_cells=10):
+    """Stream a clip once and keep only the small crops the sheets need.
+
+    Building contact sheets used to require every frame in memory, because a
+    track's crops are scattered through the clip. At 3840x2160 that is 25 MB a
+    frame -- 300 frames is 7.5 GB, which is how a machine ends up swapping and
+    a 5-minute job takes 20.
+
+    A sheet only ever shows ~10 crops of 36x36 per track. That is 39 KB per
+    track, so collecting crops in a second streaming pass costs essentially
+    nothing and bounds memory at one frame.
+
+    Returns {track_id: [crop, ...]} in time order.
+    """
+    wanted = {}                       # frame index -> [(track_id, x, y)]
+    for t in tracks:
+        step = max(1, int(np.ceil(len(t.dets) / max_cells)))
+        for d in t.dets[::step][:max_cells]:
+            wanted.setdefault(d.frame, []).append((t.id, d.x, d.y))
+
+    out = {t.id: [] for t in tracks}
+    for i, f in enumerate(source):
+        for (tid, x, y) in wanted.get(i, ()):
+            x0 = int(np.clip(x - crop // 2, 0, f.shape[1] - crop))
+            y0 = int(np.clip(y - crop // 2, 0, f.shape[0] - crop))
+            out[tid].append(f[y0:y0 + crop, x0:x0 + crop].copy())
+    return out
+
+
+def strip_from_crops(crops, max_cells=10, scale=2):
+    """One track's collected crops as a horizontal strip."""
+    h = (crops[0].shape[0] if crops else 36) * scale
+    cells = []
+    for c in crops[:max_cells]:
+        c = cv2.resize(c, (h, h), interpolation=cv2.INTER_NEAREST)
+        cv2.rectangle(c, (0, 0), (h - 1, h - 1), (60, 60, 60), 1)
+        cells.append(c)
+    while len(cells) < max_cells:
+        cells.append(np.zeros((h, h, 3), np.uint8))
+    return np.hstack(cells)
+
+
+def make_contact_sheets_streaming(tracks, source, out_dir, per_sheet=24,
+                                  crop=36, max_cells=10, scale=2, label_w=110):
+    """Contact sheets without holding the clip in memory. Same output as
+    make_contact_sheets, one extra pass over the video."""
+    crops = collect_crops(source, tracks, crop, max_cells)
+    return _render_sheets(tracks, lambda t: strip_from_crops(crops.get(t.id, []),
+                                                             max_cells, scale),
+                          out_dir, per_sheet, label_w)
+
+
+def _render_sheets(tracks, strip_fn, out_dir, per_sheet, label_w):
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    order = sorted(tracks, key=lambda t: -len(t.dets))
+    for s in range(0, len(order), per_sheet):
+        chunk = order[s:s + per_sheet]
+        rows = []
+        for t in chunk:
+            strip = strip_fn(t)
+            pad = np.zeros((strip.shape[0], label_w, 3), np.uint8)
+            cv2.putText(pad, f"#{t.id}", (6, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.62, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(pad, f"n={len(t.dets)}", (6, 46), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (170, 170, 170), 1, cv2.LINE_AA)
+            cv2.putText(pad, f"f{t.frames[0]}", (6, 64), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.42, (170, 170, 170), 1, cv2.LINE_AA)
+            rows.append(np.hstack([pad, strip]))
+        sheet = np.vstack(rows)
+        head = np.zeros((34, sheet.shape[1], 3), np.uint8)
+        cv2.putText(head, f"sheet {s // per_sheet}   "
+                          f"{len(chunk)} tracks, longest first   "
+                          f"note the IDs that are NOT firebrands",
+                    (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1,
+                    cv2.LINE_AA)
+        p = out_dir / f"sheet_{s // per_sheet:03d}.png"
+        cv2.imwrite(str(p), np.vstack([head, sheet]))
+        paths.append(p)
+    return paths
+
+
 def make_contact_sheets(tracks, frames, out_dir, per_sheet=24, crop=36,
                         max_cells=10, scale=2, label_w=110):
     """Render every track as a labelled strip, `per_sheet` strips per PNG.
