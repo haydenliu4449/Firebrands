@@ -192,9 +192,23 @@ def save_tiles(path, X, Y):
     np.savez_compressed(path, X=X, Y=(Y * 255).astype(np.uint8))
 
 
-def load_tiles(path):
+def load_tiles(path, as_float=True):
+    """Load tiles. `as_float=False` keeps the masks as uint8 -- USE THAT FOR TRAINING.
+
+    Y as float32 is four bytes per pixel: 7,400 tiles of 256x256 is 1.9 GB for
+    the masks alone, against 0.48 GB as uint8. The masks are binary; the float
+    conversion buys nothing and is the single largest avoidable allocation in
+    the training path. StreakTiles and suggested_pos_weight both accept uint8
+    and convert per tile, so nothing downstream needs the float copy.
+    """
     d = np.load(path)
-    return d["X"], d["Y"].astype(np.float32) / 255.0
+    Y = d["Y"]
+    return d["X"], (Y.astype(np.float32) / 255.0 if as_float else Y)
+
+
+def _pos_thresh(Y, thresh=0.2):
+    """Threshold on Y's own scale -- 0.2 for float masks, 51 for uint8 ones."""
+    return thresh * 255.0 if Y.dtype == np.uint8 else thresh
 
 
 def suggested_pos_weight(Y, thresh=0.2):
@@ -210,17 +224,23 @@ def suggested_pos_weight(Y, thresh=0.2):
     the imbalance depends on your ember density, which varies a lot between
     clips.
     """
-    p = float((Y > thresh).mean())
+    t = _pos_thresh(Y, thresh)
+    # Counted in blocks so this never allocates a second copy of Y.
+    hits = 0
+    for i in range(0, len(Y), 512):
+        hits += int((Y[i:i + 512] > t).sum())
+    p = hits / max(Y.size, 1)
     if p <= 0:
         return 1.0
     return float(np.clip((1.0 / p) ** 0.5, 1.0, 200.0))
 
 
 def tile_stats(X, Y):
-    pos = float((Y > 0.2).mean())
+    t = _pos_thresh(Y)
+    pos = float((Y > t).mean())
     return dict(n_tiles=len(X), tile=X.shape[-1], channels=X.shape[1],
                 positive_pixel_frac=pos,
-                tiles_with_signal=float((Y.reshape(len(Y), -1).max(1) > 0.2).mean()),
+                tiles_with_signal=float((Y.reshape(len(Y), -1).max(1) > t).mean()),
                 residual_mean=float(X.mean()), residual_p99=float(np.percentile(X, 99)))
 
 
@@ -237,23 +257,35 @@ class StreakTiles:
     scale/zoom augmentation, which changes streak length -- the quantity the
     model is meant to measure -- and mosaic-style augmentation, which
     downsamples and erases objects this small.
+
+    Pass `idx` to use a subset. THIS IS WHY TRAIN/VAL DO NOT COPY: `X[idx]` with
+    an index array is fancy indexing, which materialises a whole new array, so
+    splitting 7,400 tiles that way holds the full set twice -- a little under
+    7 GB with float masks. Indexing one tile at a time inside __getitem__ costs
+    nothing and keeps exactly one copy of the data alive. Masks may be uint8
+    (preferred) or float32; either is converted to 0..1 here.
     """
 
-    def __init__(self, X, Y, train=True, gain_jitter=0.25, noise=2.0, seed=0):
+    def __init__(self, X, Y, train=True, gain_jitter=0.25, noise=2.0, seed=0,
+                 idx=None):
         import torch  # noqa: F401  (import here so tile building stays torch-free)
         self.X, self.Y = X, Y
+        self.idx = None if idx is None else np.asarray(idx)
         self.train = train
         self.gain_jitter = gain_jitter
         self.noise = noise
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
-        return len(self.X)
+        return len(self.X) if self.idx is None else len(self.idx)
 
     def __getitem__(self, i):
         import torch
-        x = self.X[i].astype(np.float32)
-        y = self.Y[i].astype(np.float32)[None]
+        j = i if self.idx is None else int(self.idx[i])
+        x = self.X[j].astype(np.float32)
+        y = self.Y[j]
+        y = (y.astype(np.float32) / 255.0 if y.dtype == np.uint8
+             else y.astype(np.float32))[None]
 
         if self.train:
             k = int(self.rng.integers(4))

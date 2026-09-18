@@ -346,8 +346,11 @@ def stage_train(args, cfg):
         raise SystemExit("no tiles -- run --stage tiles first")
 
     from firebrand import train as TR
-    X, Y = DS.load_tiles(tiles_path)
-    log(f"  {len(X)} tiles, {X.shape[1:]} each")
+    # as_float=False keeps masks uint8; see load_tiles. With float masks the
+    # array pair is ~3.4 GB instead of ~1.9 GB at 7k tiles.
+    X, Y = DS.load_tiles(tiles_path, as_float=False)
+    log(f"  {len(X)} tiles, {X.shape[1:]} each, "
+        f"{(X.nbytes + Y.nbytes)/1e9:.2f} GB resident")
     cfg.train.epochs = args.epochs
     with Timer(f"  training {args.epochs} epochs"):
         TR.train(X, Y, cfg.train, out_dir=work / "runs" / "streak", log_every=1)
